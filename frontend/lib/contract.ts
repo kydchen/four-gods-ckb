@@ -383,7 +383,10 @@ export async function buildResolveTx(
   if (state.status !== STATUS_REVEAL) throw new Error("not reveal phase");
   if (state.players.some((p) => !p.hasRevealed)) throw new Error("not all revealed");
 
-  const newState: GameState = JSON.parse(JSON.stringify(state));
+  const newState: GameState = {
+    ...state,
+    players: state.players.map((p) => ({ ...p })),
+  };
   resolveRound(newState);
 
   const tx = ccc.Transaction.from({
