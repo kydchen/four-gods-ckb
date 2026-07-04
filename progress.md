@@ -6,7 +6,9 @@ Progress:
 - Documented the Vercel root directory and environment flow.
 - Verified `pnpm deploy:contract:dry-run` and `pnpm build`.
 - Updated `.env.example` to match the current contract binary code hash.
+- Fixed lock-script game transitions and added a regression test for joining when the game contract is used as the cell lock.
+- Verified `cargo test --package tests`, `pnpm build`, and `pnpm deploy:contract:dry-run`.
 
 TODO:
-- Run `CKB_PRIVATE_KEY=0x... pnpm deploy:contract` from `frontend/` with a funded testnet key.
-- Paste the printed `NEXT_PUBLIC_*` values into Vercel.
+- Redeploy the contract after the lock-script fix.
+- Paste the new printed `NEXT_PUBLIC_*` values into Vercel.

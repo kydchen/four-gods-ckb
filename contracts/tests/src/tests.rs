@@ -149,6 +149,12 @@ fn game_type_script(ctx: &mut Context) -> Script {
         .expect("game type script")
 }
 
+fn game_lock_script(ctx: &mut Context) -> Script {
+    let out_point = ctx.deploy_cell_by_name("four-gods");
+    ctx.build_script(&out_point, Bytes::from(vec![42]))
+        .expect("game lock script")
+}
+
 fn empty_witness() -> Bytes {
     WitnessArgs::new_builder().build().as_bytes()
 }
@@ -244,6 +250,41 @@ fn test_create_game() {
         .build();
     let tx = context.complete_tx(tx);
     context.verify_tx(&tx, 70_000_000).expect("create passes");
+}
+
+#[test]
+fn test_join_game_when_contract_is_lock() {
+    let mut context = Context::default();
+    let game_lock = game_lock_script(&mut context);
+    let host_lock = always_success_lock(&mut context, Bytes::from(vec![0]));
+
+    let mut state = GameState::waiting(2, 2);
+    let (game_out, game_data) = build_output(200_000, &game_lock, None, serialize_game(&state));
+    let game_out_point = context.create_cell(game_out, game_data);
+
+    add_player(&mut state, Player::new(host_lock.as_bytes(), 200, 200));
+    let (game_out, game_data) = build_output(200_200, &game_lock, None, serialize_game(&state));
+    let host_fund = fund_cell(&mut context, &host_lock, 200_000);
+    let _game_out_point = step_transition(
+        &mut context,
+        "join host with game contract lock",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(host_fund).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_800)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
 }
 
 #[test]

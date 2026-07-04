@@ -259,6 +259,68 @@ fn require_equal_states(a: &GameState, b: &GameState) -> Result<(), Error> {
     Ok(())
 }
 
+fn load_next_game_data() -> Result<Option<Vec<u8>>, Error> {
+    if let Ok(data) = load_cell_data(0, Source::GroupOutput) {
+        return Ok(Some(data));
+    }
+
+    let group_lock = match load_cell_lock(0, Source::GroupInput) {
+        Ok(lock) => lock,
+        Err(_) => return Ok(None),
+    };
+
+    let mut found = None;
+    let mut i = 0;
+    loop {
+        match load_cell_lock(i, Source::Output) {
+            Ok(lock) => {
+                if lock.as_slice() == group_lock.as_slice() {
+                    if found.is_some() {
+                        return Err(Error::InvalidOutput);
+                    }
+                    let data =
+                        load_cell_data(i, Source::Output).map_err(|_| Error::InvalidOutput)?;
+                    found = Some(data);
+                }
+            }
+            Err(_) => break,
+        }
+        i += 1;
+    }
+    Ok(found)
+}
+
+fn load_next_game_capacity() -> Result<Option<u64>, Error> {
+    if let Ok(capacity) = load_cell_capacity(0, Source::GroupOutput) {
+        return Ok(Some(capacity));
+    }
+
+    let group_lock = match load_cell_lock(0, Source::GroupInput) {
+        Ok(lock) => lock,
+        Err(_) => return Ok(None),
+    };
+
+    let mut found = None;
+    let mut i = 0;
+    loop {
+        match load_cell_lock(i, Source::Output) {
+            Ok(lock) => {
+                if lock.as_slice() == group_lock.as_slice() {
+                    if found.is_some() {
+                        return Err(Error::InvalidOutput);
+                    }
+                    let capacity =
+                        load_cell_capacity(i, Source::Output).map_err(|_| Error::InvalidOutput)?;
+                    found = Some(capacity);
+                }
+            }
+            Err(_) => break,
+        }
+        i += 1;
+    }
+    Ok(found)
+}
+
 fn validate_create(_input: Option<&[u8]>, output: &[u8]) -> Result<(), Error> {
     let state = GameState::deserialize(output)?;
     if state.status != STATUS_WAITING
@@ -299,11 +361,15 @@ fn validate_join(input: &[u8], output: &[u8]) -> Result<(), Error> {
     if added.lock_script.is_empty() || !input_has_lock(&added.lock_script) {
         return Err(Error::BadSignature);
     }
-    if old.players.iter().any(|p| p.lock_script == added.lock_script) {
+    if old
+        .players
+        .iter()
+        .any(|p| p.lock_script == added.lock_script)
+    {
         return Err(Error::PlayerCount);
     }
     let old_cap = load_cell_capacity(0, Source::GroupInput).map_err(|_| Error::NotFound)?;
-    let new_cap = load_cell_capacity(0, Source::GroupOutput).map_err(|_| Error::NotFound)?;
+    let new_cap = load_next_game_capacity()?.ok_or(Error::NotFound)?;
     if new_cap < old_cap + added.bet {
         return Err(Error::BadCapacity);
     }
@@ -556,7 +622,8 @@ fn validate_finish(input: &[u8], _output: &[u8]) -> Result<(), Error> {
                         if used.contains(&i) {
                             return Err(Error::InvalidOutput);
                         }
-                        let cap = load_cell_capacity(i, Source::Output).map_err(|_| Error::InvalidOutput)?;
+                        let cap = load_cell_capacity(i, Source::Output)
+                            .map_err(|_| Error::InvalidOutput)?;
                         if cap >= p.balance {
                             used.push(i);
                             found = true;
@@ -580,9 +647,9 @@ pub fn program_entry() -> i8 {
         Ok(d) => Some(d),
         Err(_) => None,
     };
-    let output_data = match load_cell_data(0, Source::GroupOutput) {
-        Ok(d) => Some(d),
-        Err(_) => None,
+    let output_data = match load_next_game_data() {
+        Ok(d) => d,
+        Err(e) => return e.into(),
     };
 
     let result = match (input_data.as_deref(), output_data.as_deref()) {
