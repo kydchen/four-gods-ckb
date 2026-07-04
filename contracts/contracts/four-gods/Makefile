@@ -2,7 +2,7 @@
 # making it hard to use.
 cur_dir = $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
 
-TOP := $(cur_dir)
+TOP := $(cur_dir)../..
 # RUSTFLAGS that are likely to be tweaked by developers. For example,
 # while we enable debug logs by default here, some might want to strip them
 # for minimal code size / consumed cycles.
