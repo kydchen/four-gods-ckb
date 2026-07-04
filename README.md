@@ -34,6 +34,27 @@ cd contracts
 make build
 ```
 
+## Testnet deployment
+
+Deploy the contract cell with CCC, then paste the printed `NEXT_PUBLIC_*` values into Vercel.
+
+```bash
+cd frontend
+pnpm deploy:contract:dry-run
+CKB_PRIVATE_KEY=0x... pnpm deploy:contract
+```
+
+By default the deploy script uses CKB testnet and an unspendable zero-lock for the contract cell, so wallet auto-selection cannot accidentally spend the deployed code cell while testing. Use `CKB_DEPLOY_LOCK=owner` only if you want the deployer wallet to keep control of the cell.
+
+Vercel settings:
+
+```text
+Repository: kydchen/four-gods-ckb
+Root Directory: frontend
+Framework Preset: Next.js
+Build Command: pnpm build
+```
+
 ## License
 
 MIT

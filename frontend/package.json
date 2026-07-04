@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "deploy:contract": "node scripts/deploy-contract.mjs",
+    "deploy:contract:dry-run": "node scripts/deploy-contract.mjs --dry-run",
     "start": "next start",
     "lint": "next lint"
   },
