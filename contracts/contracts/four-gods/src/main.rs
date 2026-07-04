@@ -68,6 +68,7 @@ struct Player {
     survived: bool,
     has_committed: bool,
     has_revealed: bool,
+    active_from_round: u8,
 }
 
 impl Player {
@@ -82,6 +83,7 @@ impl Player {
         let survived = read_u8(data, pos)? != 0;
         let has_committed = read_u8(data, pos)? != 0;
         let has_revealed = read_u8(data, pos)? != 0;
+        let active_from_round = read_u8(data, pos)?;
         Ok(Player {
             lock_script,
             balance,
@@ -92,6 +94,7 @@ impl Player {
             survived,
             has_committed,
             has_revealed,
+            active_from_round,
         })
     }
 }
@@ -324,14 +327,30 @@ fn load_next_game_capacity() -> Result<Option<u64>, Error> {
 fn validate_create(_input: Option<&[u8]>, output: &[u8]) -> Result<(), Error> {
     let state = GameState::deserialize(output)?;
     if state.status != STATUS_WAITING
-        || state.num_players != 0
-        || !state.players.is_empty()
         || state.min_players < MIN_PLAYERS
         || state.max_players > MAX_PLAYERS
         || state.min_players > state.max_players
+        || state.num_players as usize != state.players.len()
+        || state.num_players > 1
         || state.timeout_blocks == 0
     {
         return Err(Error::StateTransition);
+    }
+    if let Some(host) = state.players.first() {
+        if host.bet == 0
+            || host.balance != host.bet
+            || host.used_directions != 0
+            || host.commit_hash != [0u8; 32]
+            || host.revealed_direction != DIR_NONE
+            || !host.survived
+            || host.has_committed
+            || host.has_revealed
+            || host.active_from_round != 0
+            || host.lock_script.is_empty()
+            || !input_has_lock(&host.lock_script)
+        {
+            return Err(Error::StateTransition);
+        }
     }
     Ok(())
 }
@@ -339,7 +358,7 @@ fn validate_create(_input: Option<&[u8]>, output: &[u8]) -> Result<(), Error> {
 fn validate_join(input: &[u8], output: &[u8]) -> Result<(), Error> {
     let old = GameState::deserialize(input)?;
     let new = GameState::deserialize(output)?;
-    if old.status != STATUS_WAITING || new.status != STATUS_WAITING {
+    if old.status == STATUS_FINISHED || new.status != old.status {
         return Err(Error::StateTransition);
     }
     if new.num_players != old.num_players + 1 || new.players.len() != old.players.len() + 1 {
@@ -355,7 +374,24 @@ fn validate_join(input: &[u8], output: &[u8]) -> Result<(), Error> {
     require_equal_states(&expected, &new)?;
 
     let added = new.players.last().ok_or(Error::PlayerCount)?;
-    if added.bet == 0 || added.balance != added.bet {
+    let active_from_round = if old.status == STATUS_WAITING {
+        0
+    } else {
+        old.round + 1
+    };
+    if active_from_round >= ROUNDS {
+        return Err(Error::PlayerCount);
+    }
+    if added.bet == 0
+        || added.balance != added.bet
+        || added.used_directions != 0
+        || added.commit_hash != [0u8; 32]
+        || added.revealed_direction != DIR_NONE
+        || !added.survived
+        || added.has_committed
+        || added.has_revealed
+        || added.active_from_round != active_from_round
+    {
         return Err(Error::BadCapacity);
     }
     if added.lock_script.is_empty() || !input_has_lock(&added.lock_script) {
@@ -376,8 +412,14 @@ fn validate_join(input: &[u8], output: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn compute_reveal_order(players: &[Player]) -> Vec<u8> {
-    let mut order: Vec<u8> = (0..players.len() as u8).collect();
+fn player_is_active(player: &Player, round: u8) -> bool {
+    player.survived && player.active_from_round <= round
+}
+
+fn compute_reveal_order(players: &[Player], round: u8) -> Vec<u8> {
+    let mut order: Vec<u8> = (0..players.len() as u8)
+        .filter(|i| player_is_active(&players[*i as usize], round))
+        .collect();
     order.sort_by(|a, b| {
         let pa = &players[*a as usize];
         let pb = &players[*b as usize];
@@ -408,7 +450,7 @@ fn validate_start(input: &[u8], output: &[u8]) -> Result<(), Error> {
     expected.banker_index = 0;
     expected.reveal_cursor = 0;
     expected.players = new.players.clone();
-    expected.reveal_order = compute_reveal_order(&expected.players);
+    expected.reveal_order = compute_reveal_order(&expected.players, expected.round);
     require_equal_states(&expected, &new)?;
 
     // banker's balance must cover potential payouts to all other players
@@ -421,17 +463,24 @@ fn validate_start(input: &[u8], output: &[u8]) -> Result<(), Error> {
 }
 
 fn all_committed(state: &GameState) -> bool {
-    state.players.iter().all(|p| p.has_committed)
+    state
+        .players
+        .iter()
+        .filter(|p| player_is_active(p, state.round))
+        .all(|p| p.has_committed)
 }
 
 fn resolve_round(state: &mut GameState) -> Result<(), Error> {
     let banker_idx = state.banker_index as usize;
+    if !player_is_active(&state.players[banker_idx], state.round) {
+        return Err(Error::StateTransition);
+    }
     let banker_dir = state.players[banker_idx].revealed_direction;
     if banker_dir >= DIRECTION_COUNT {
         return Err(Error::BadReveal);
     }
     for i in 0..state.players.len() {
-        if i == banker_idx {
+        if i == banker_idx || !player_is_active(&state.players[i], state.round) {
             continue;
         }
         let dir = state.players[i].revealed_direction;
@@ -458,6 +507,14 @@ fn resolve_round(state: &mut GameState) -> Result<(), Error> {
         }
         state.status = STATUS_FINISHED;
     } else {
+        let next_round = state.round + 1;
+        let newly_active_bets: u64 = state
+            .players
+            .iter()
+            .filter(|p| p.survived && p.active_from_round == next_round)
+            .map(|p| p.bet)
+            .sum();
+        state.players[banker_idx].balance += newly_active_bets;
         state.round += 1;
         state.status = STATUS_COMMIT;
         state.reveal_cursor = 0;
@@ -467,6 +524,7 @@ fn resolve_round(state: &mut GameState) -> Result<(), Error> {
             p.has_committed = false;
             p.has_revealed = false;
         }
+        state.reveal_order = compute_reveal_order(&state.players, state.round);
     }
     Ok(())
 }
@@ -476,6 +534,9 @@ fn validate_commit(input: &[u8], output: &[u8]) -> Result<(), Error> {
     let new = GameState::deserialize(output)?;
     if old.status != STATUS_COMMIT || new.status != STATUS_COMMIT {
         return Err(Error::StateTransition);
+    }
+    if old.players.len() != new.players.len() {
+        return Err(Error::BadCommit);
     }
 
     // find exactly one player who moved from uncommitted to committed
@@ -495,10 +556,12 @@ fn validate_commit(input: &[u8], output: &[u8]) -> Result<(), Error> {
             || np.used_directions != op.used_directions
             || np.revealed_direction != op.revealed_direction
             || np.survived != op.survived
+            || np.active_from_round != op.active_from_round
             || np.has_revealed != op.has_revealed
             || op.has_committed
             || !np.has_committed
             || np.commit_hash == [0u8; 32]
+            || !player_is_active(op, old.round)
         {
             return Err(Error::BadCommit);
         }
@@ -518,7 +581,11 @@ fn validate_commit(input: &[u8], output: &[u8]) -> Result<(), Error> {
 }
 
 fn all_revealed(state: &GameState) -> bool {
-    state.players.iter().all(|p| p.has_revealed)
+    state
+        .players
+        .iter()
+        .filter(|p| player_is_active(p, state.round))
+        .all(|p| p.has_revealed)
 }
 
 fn validate_reveal(input: &[u8], output: &[u8]) -> Result<(), Error> {
@@ -531,10 +598,17 @@ fn validate_reveal(input: &[u8], output: &[u8]) -> Result<(), Error> {
     if old.status == STATUS_COMMIT && !all_committed(&old) {
         return Err(Error::BadReveal);
     }
-    if old.reveal_cursor as usize >= old.players.len() {
+    if old.players.len() != new.players.len() {
+        return Err(Error::BadReveal);
+    }
+    if old.reveal_cursor as usize >= old.reveal_order.len() {
         return Err(Error::BadReveal);
     }
     let expected_idx = old.reveal_order[old.reveal_cursor as usize] as usize;
+    if expected_idx >= old.players.len() || !player_is_active(&old.players[expected_idx], old.round)
+    {
+        return Err(Error::BadReveal);
+    }
 
     let mut changed: Option<usize> = None;
     for i in 0..old.players.len() {
@@ -551,6 +625,7 @@ fn validate_reveal(input: &[u8], output: &[u8]) -> Result<(), Error> {
             || np.bet != op.bet
             || np.commit_hash != op.commit_hash
             || np.survived != op.survived
+            || np.active_from_round != op.active_from_round
             || !op.has_committed
             || op.has_revealed
             || !np.has_revealed
@@ -599,9 +674,29 @@ fn validate_resolve(input: &[u8], output: &[u8]) -> Result<(), Error> {
         return Err(Error::BadReveal);
     }
 
+    let newly_active_bets: u64 = if old.round < ROUNDS - 1 {
+        let next_round = old.round + 1;
+        old.players
+            .iter()
+            .filter(|p| p.survived && p.active_from_round == next_round)
+            .map(|p| p.bet)
+            .sum()
+    } else {
+        0
+    };
     let mut expected = old.clone();
     resolve_round(&mut expected)?;
     require_equal_states(&expected, &new)?;
+    if newly_active_bets > 0 {
+        if !input_has_lock(&old.players[old.banker_index as usize].lock_script) {
+            return Err(Error::Unauthorized);
+        }
+        let old_cap = load_cell_capacity(0, Source::GroupInput).map_err(|_| Error::NotFound)?;
+        let new_cap = load_next_game_capacity()?.ok_or(Error::NotFound)?;
+        if new_cap < old_cap + newly_active_bets {
+            return Err(Error::BadCapacity);
+        }
+    }
     Ok(())
 }
 
@@ -666,9 +761,20 @@ pub fn program_entry() -> i8 {
             match (old.status, new.status) {
                 (STATUS_WAITING, STATUS_WAITING) => validate_join(inp, out),
                 (STATUS_WAITING, STATUS_COMMIT) => validate_start(inp, out),
-                (STATUS_COMMIT, STATUS_COMMIT) => validate_commit(inp, out),
-                (STATUS_COMMIT, STATUS_REVEAL) | (STATUS_REVEAL, STATUS_REVEAL) => {
-                    validate_reveal(inp, out)
+                (STATUS_COMMIT, STATUS_COMMIT) => {
+                    if new.players.len() == old.players.len() + 1 {
+                        validate_join(inp, out)
+                    } else {
+                        validate_commit(inp, out)
+                    }
+                }
+                (STATUS_COMMIT, STATUS_REVEAL) => validate_reveal(inp, out),
+                (STATUS_REVEAL, STATUS_REVEAL) => {
+                    if new.players.len() == old.players.len() + 1 {
+                        validate_join(inp, out)
+                    } else {
+                        validate_reveal(inp, out)
+                    }
                 }
                 (STATUS_REVEAL, STATUS_COMMIT) | (STATUS_REVEAL, STATUS_FINISHED) => {
                     validate_resolve(inp, out)

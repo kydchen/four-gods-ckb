@@ -1,6 +1,7 @@
 "use client";
 import { ccc } from "@ckb-ccc/connector-react";
 import { getClient } from "@/lib/client";
+import "./globals.css";
 
 export default function RootLayout({
   children,

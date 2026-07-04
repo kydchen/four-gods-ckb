@@ -10,6 +10,7 @@ export interface PlayerState {
   survived: boolean;
   hasCommitted: boolean;
   hasRevealed: boolean;
+  activeFromRound: number;
 }
 
 export interface GameState {
@@ -37,22 +38,26 @@ export const DIRECTIONS = 4;
 export const ROUNDS = 3;
 
 function readU8(data: Uint8Array, pos: { i: number }): number {
+  if (pos.i >= data.length) throw new Error("unexpected end of data");
   return data[pos.i++];
 }
 
 function readU16(data: Uint8Array, pos: { i: number }): number {
+  if (pos.i + 2 > data.length) throw new Error("unexpected end of data");
   const v = new DataView(data.buffer, data.byteOffset + pos.i, 2).getUint16(0, true);
   pos.i += 2;
   return v;
 }
 
 function readU64(data: Uint8Array, pos: { i: number }): bigint {
+  if (pos.i + 8 > data.length) throw new Error("unexpected end of data");
   const v = new DataView(data.buffer, data.byteOffset + pos.i, 8).getBigUint64(0, true);
   pos.i += 8;
   return v;
 }
 
 function readBytes(data: Uint8Array, pos: { i: number }, len: number): Uint8Array {
+  if (pos.i + len > data.length) throw new Error("unexpected end of data");
   const slice = data.slice(pos.i, pos.i + len);
   pos.i += len;
   return slice;
@@ -101,6 +106,7 @@ export function serializePlayer(p: PlayerState): Uint8Array {
   writeU8(buf, p.survived ? 1 : 0);
   writeU8(buf, p.hasCommitted ? 1 : 0);
   writeU8(buf, p.hasRevealed ? 1 : 0);
+  writeU8(buf, p.activeFromRound);
   return Uint8Array.from(buf);
 }
 
@@ -115,6 +121,7 @@ export function deserializePlayer(data: Uint8Array, pos: { i: number }): PlayerS
   const survived = readU8(data, pos) !== 0;
   const hasCommitted = readU8(data, pos) !== 0;
   const hasRevealed = readU8(data, pos) !== 0;
+  const activeFromRound = readU8(data, pos);
   return {
     lockScript,
     balance,
@@ -125,6 +132,7 @@ export function deserializePlayer(data: Uint8Array, pos: { i: number }): PlayerS
     survived,
     hasCommitted,
     hasRevealed,
+    activeFromRound,
   };
 }
 
@@ -202,8 +210,28 @@ export function hashReveal(direction: number, nonce: Uint8Array): string {
   return "0x" + hasher.digest("hex");
 }
 
-export function computeRevealOrder(players: PlayerState[]): number[] {
-  const order = players.map((_, i) => i);
+export function isPlayerActive(player: PlayerState, round: number): boolean {
+  return player.survived && player.activeFromRound <= round;
+}
+
+export function activePlayerIndexes(state: GameState): number[] {
+  return state.players
+    .map((player, index) => ({ player, index }))
+    .filter(({ player }) => isPlayerActive(player, state.round))
+    .map(({ index }) => index);
+}
+
+export function pendingPlayerIndexes(state: GameState): number[] {
+  return state.players
+    .map((player, index) => ({ player, index }))
+    .filter(({ player }) => player.survived && player.activeFromRound > state.round)
+    .map(({ index }) => index);
+}
+
+export function computeRevealOrder(players: PlayerState[], round = 0): number[] {
+  const order = players
+    .map((_, i) => i)
+    .filter((i) => isPlayerActive(players[i], round));
   order.sort((a, b) => {
     const cmp = Number(players[a].bet - players[b].bet);
     if (cmp !== 0) return cmp;

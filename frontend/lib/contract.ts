@@ -9,6 +9,7 @@ import {
   GameState,
   hashReveal,
   hexToBytes,
+  isPlayerActive,
   serializeGame,
   STATUS_COMMIT,
   STATUS_FINISHED,
@@ -21,7 +22,27 @@ const FOUR_GODS_HASH_TYPE = (process.env.NEXT_PUBLIC_FOUR_GODS_HASH_TYPE ?? "dat
 const FOUR_GODS_TX_HASH = process.env.NEXT_PUBLIC_FOUR_GODS_TX_HASH!;
 const FOUR_GODS_TX_INDEX = Number(process.env.NEXT_PUBLIC_FOUR_GODS_TX_INDEX ?? 0);
 
+export type GameCell = { gameId: string; cell: ccc.Cell; state: GameState };
+
+export function hasFourGodsConfig(): boolean {
+  return Boolean(
+    FOUR_GODS_CODE_HASH &&
+      FOUR_GODS_TX_HASH &&
+      !FOUR_GODS_TX_HASH.startsWith("<") &&
+      Number.isFinite(FOUR_GODS_TX_INDEX)
+  );
+}
+
+function assertFourGodsConfig() {
+  if (!hasFourGodsConfig()) {
+    throw new Error("Four Gods contract env vars are not configured");
+  }
+}
+
 export function getFourGodsLockScript(gameId: string): ccc.Script {
+  if (!FOUR_GODS_CODE_HASH) {
+    throw new Error("NEXT_PUBLIC_FOUR_GODS_CODE_HASH is not configured");
+  }
   return ccc.Script.from({
     codeHash: FOUR_GODS_CODE_HASH,
     hashType: FOUR_GODS_HASH_TYPE,
@@ -30,6 +51,7 @@ export function getFourGodsLockScript(gameId: string): ccc.Script {
 }
 
 export function getScriptCellDep(): ccc.CellDep {
+  assertFourGodsConfig();
   return ccc.CellDep.from({
     outPoint: {
       txHash: FOUR_GODS_TX_HASH,
@@ -49,7 +71,7 @@ export function generateGameId(creatorAddress: string, timestamp: number): strin
 export async function fetchGameState(
   client: ccc.Client,
   gameId: string
-): Promise<{ cell: ccc.Cell; state: GameState } | null> {
+): Promise<GameCell | null> {
   const lockScript = getFourGodsLockScript(gameId);
   for await (const cell of client.findCells({
     script: lockScript,
@@ -58,9 +80,52 @@ export async function fetchGameState(
     withData: true,
   })) {
     const state = deserializeGame(hexToBytes(cell.outputData));
-    return { cell, state };
+    return { gameId, cell, state };
   }
   return null;
+}
+
+export async function fetchLobbyGames(client: ccc.Client, limit = 80): Promise<GameCell[]> {
+  if (!FOUR_GODS_CODE_HASH) return [];
+  const rooms: GameCell[] = [];
+  const prefixLock = getFourGodsLockScript("0x");
+  const searchKey = {
+    script: prefixLock,
+    scriptType: "lock" as const,
+    scriptSearchMode: "prefix" as const,
+    withData: true,
+  };
+  let cursor: string | undefined;
+
+  while (rooms.length < limit) {
+    const { cells, lastCursor } = await client.findCellsPagedNoCache(
+      searchKey,
+      "desc",
+      Math.min(50, limit - rooms.length),
+      cursor
+    );
+    for (const cell of cells) {
+      try {
+        const state = deserializeGame(hexToBytes(cell.outputData));
+        rooms.push({
+          gameId: cell.cellOutput.lock.args,
+          cell,
+          state,
+        });
+      } catch {
+        // Ignore old-format or unrelated cells if the indexer returns a broader prefix match.
+      }
+    }
+    if (cells.length === 0 || cells.length < Math.min(50, limit - rooms.length)) break;
+    cursor = lastCursor;
+  }
+
+  return rooms.sort((a, b) => {
+    const waitingDelta =
+      Number(b.state.status === STATUS_WAITING) - Number(a.state.status === STATUS_WAITING);
+    if (waitingDelta !== 0) return waitingDelta;
+    return b.state.players.length - a.state.players.length;
+  });
 }
 
 function gameOutput(
@@ -92,10 +157,30 @@ export async function buildCreateGameTx(
 ) {
   const address = await signer.getRecommendedAddress();
   const gameId = generateGameId(address, Date.now());
-  const state = emptyGameState(config.minPlayers, config.maxPlayers, config.timeoutBlocks);
+  const unitBet = unitBetToCapacity(config.unitBetCkb);
+  const lockScript = (await signer.getRecommendedAddressObj()).script;
+  const lockHex = bytesToHex(lockScript.toBytes());
+  const state: GameState = {
+    ...emptyGameState(config.minPlayers, config.maxPlayers, config.timeoutBlocks),
+    numPlayers: 1,
+    players: [
+      {
+        lockScript: lockHex,
+        balance: unitBet,
+        bet: unitBet,
+        usedDirections: 0,
+        commitHash: "0x" + "00".repeat(32),
+        revealedDirection: DIR_NONE,
+        survived: true,
+        hasCommitted: false,
+        hasRevealed: false,
+        activeFromRound: 0,
+      },
+    ],
+  };
 
   const tx = ccc.Transaction.from({
-    outputs: [gameOutput(gameId, state, GAME_OVERHEAD)],
+    outputs: [gameOutput(gameId, state, GAME_OVERHEAD + unitBet)],
     outputsData: [stateData(state)],
     cellDeps: [getScriptCellDep()],
     witnesses: ["0x"],
@@ -116,14 +201,19 @@ export async function buildJoinGameTx(
   const lockScript = (await signer.getRecommendedAddressObj()).script;
   const lockHex = bytesToHex(lockScript.toBytes());
 
-  if (current.state.status !== STATUS_WAITING) {
-    throw new Error("game is not waiting for players");
+  if (current.state.status === STATUS_FINISHED) {
+    throw new Error("game is finished");
   }
   if (current.state.players.length >= current.state.maxPlayers) {
     throw new Error("game is full");
   }
   if (current.state.players.some((p) => p.lockScript === lockHex)) {
     throw new Error("already joined");
+  }
+  const activeFromRound =
+    current.state.status === STATUS_WAITING ? 0 : current.state.round + 1;
+  if (activeFromRound >= 3) {
+    throw new Error("too late to join this game");
   }
 
   const newState: GameState = {
@@ -141,6 +231,7 @@ export async function buildJoinGameTx(
         survived: true,
         hasCommitted: false,
         hasRevealed: false,
+        activeFromRound,
       },
     ],
   };
@@ -185,9 +276,10 @@ export async function buildStartGameTx(
     revealCursor: 0,
     players: state.players.map((p, i) => ({
       ...p,
+      activeFromRound: 0,
       balance: i === 0 ? unitBet * BigInt(n) : p.balance,
     })),
-    revealOrder: computeRevealOrder(state.players),
+    revealOrder: computeRevealOrder(state.players, 0),
   };
 
   const tx = ccc.Transaction.from({
@@ -223,6 +315,9 @@ export async function buildCommitTx(
   const lockHex = bytesToHex(lockScript.toBytes());
   const idx = state.players.findIndex((p) => p.lockScript === lockHex);
   if (idx === -1) throw new Error("not a player");
+  if (!isPlayerActive(state.players[idx], state.round)) {
+    throw new Error("you enter on the next round");
+  }
   if (state.players[idx].hasCommitted) throw new Error("already committed");
   if (direction < 0 || direction >= DIRECTIONS) throw new Error("bad direction");
 
@@ -264,7 +359,7 @@ export async function buildRevealTx(
   if (state.status !== STATUS_COMMIT && state.status !== STATUS_REVEAL) {
     throw new Error("not reveal phase");
   }
-  if (state.players.some((p) => !p.hasCommitted)) {
+  if (state.players.some((p) => isPlayerActive(p, state.round) && !p.hasCommitted)) {
     throw new Error("not all committed");
   }
 
@@ -272,6 +367,9 @@ export async function buildRevealTx(
   const lockHex = bytesToHex(lockScript.toBytes());
   const idx = state.players.findIndex((p) => p.lockScript === lockHex);
   if (idx === -1) throw new Error("not a player");
+  if (!isPlayerActive(state.players[idx], state.round)) {
+    throw new Error("you enter on the next round");
+  }
   if (state.players[idx].hasRevealed) throw new Error("already revealed");
 
   const expectedIdx = state.revealOrder[state.revealCursor];
@@ -341,6 +439,7 @@ function resolveRound(state: GameState) {
 
   for (let i = 0; i < state.players.length; i++) {
     if (i === bankerIdx) continue;
+    if (!isPlayerActive(state.players[i], state.round)) continue;
     const dir = state.players[i].revealedDirection;
     if (dir >= DIRECTIONS) throw new Error("player not revealed");
     if (dir === bankerDir) {
@@ -354,7 +453,7 @@ function resolveRound(state: GameState) {
   if (state.round === 2) {
     for (let i = 0; i < state.players.length; i++) {
       if (i === bankerIdx) continue;
-      if (state.players[i].survived) {
+      if (isPlayerActive(state.players[i], state.round)) {
         const bet = state.players[i].bet;
         state.players[i].balance += bet;
         state.players[bankerIdx].balance -= bet;
@@ -362,6 +461,11 @@ function resolveRound(state: GameState) {
     }
     state.status = STATUS_FINISHED;
   } else {
+    const nextRound = state.round + 1;
+    const newlyActiveBet = state.players
+      .filter((p) => p.survived && p.activeFromRound === nextRound)
+      .reduce((sum, p) => sum + p.bet, 0n);
+    state.players[bankerIdx].balance += newlyActiveBet;
     state.round += 1;
     state.status = STATUS_COMMIT;
     state.revealCursor = 0;
@@ -371,6 +475,7 @@ function resolveRound(state: GameState) {
       p.hasCommitted = false;
       p.hasRevealed = false;
     }
+    state.revealOrder = computeRevealOrder(state.players, state.round);
   }
 }
 
@@ -381,12 +486,20 @@ export async function buildResolveTx(
 ) {
   const state = current.state;
   if (state.status !== STATUS_REVEAL) throw new Error("not reveal phase");
-  if (state.players.some((p) => !p.hasRevealed)) throw new Error("not all revealed");
+  if (state.players.some((p) => isPlayerActive(p, state.round) && !p.hasRevealed)) {
+    throw new Error("not all revealed");
+  }
 
   const newState: GameState = {
     ...state,
     players: state.players.map((p) => ({ ...p })),
   };
+  const newlyActiveBet =
+    state.round < 2
+      ? state.players
+          .filter((p) => p.survived && p.activeFromRound === state.round + 1)
+          .reduce((sum, p) => sum + p.bet, 0n)
+      : 0n;
   resolveRound(newState);
 
   const tx = ccc.Transaction.from({
@@ -397,7 +510,7 @@ export async function buildResolveTx(
         outputData: current.cell.outputData,
       },
     ],
-    outputs: [gameOutput(gameId, newState, BigInt(current.cell.cellOutput.capacity))],
+    outputs: [gameOutput(gameId, newState, BigInt(current.cell.cellOutput.capacity) + newlyActiveBet)],
     outputsData: [stateData(newState)],
     cellDeps: [getScriptCellDep()],
     witnesses: ["0x"],

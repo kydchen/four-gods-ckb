@@ -27,6 +27,7 @@ struct Player {
     survived: bool,
     has_committed: bool,
     has_revealed: bool,
+    active_from_round: u8,
 }
 
 impl Player {
@@ -41,6 +42,7 @@ impl Player {
             survived: true,
             has_committed: false,
             has_revealed: false,
+            active_from_round: 0,
         }
     }
 }
@@ -96,6 +98,7 @@ fn serialize_player(p: &Player) -> Bytes {
     buf.push(p.survived as u8);
     buf.push(p.has_committed as u8);
     buf.push(p.has_revealed as u8);
+    buf.push(p.active_from_round);
     buf.into()
 }
 
@@ -172,7 +175,9 @@ fn build_output(
     type_: Option<&Script>,
     data: Bytes,
 ) -> (CellOutput, Bytes) {
-    let mut builder = CellOutput::new_builder().capacity(capacity).lock(lock.clone());
+    let mut builder = CellOutput::new_builder()
+        .capacity(capacity)
+        .lock(lock.clone());
     if let Some(t) = type_ {
         builder = builder.type_(Some(t.clone()).pack());
     }
@@ -184,8 +189,13 @@ fn add_player(state: &mut GameState, player: Player) {
     state.players.push(player);
 }
 
-fn compute_reveal_order(players: &[Player]) -> Vec<u8> {
-    let mut order: Vec<u8> = (0..players.len() as u8).collect();
+fn compute_reveal_order(players: &[Player], round: u8) -> Vec<u8> {
+    let mut order: Vec<u8> = (0..players.len() as u8)
+        .filter(|i| {
+            let player = &players[*i as usize];
+            player.survived && player.active_from_round <= round
+        })
+        .collect();
     order.sort_by(|a, b| {
         let pa = &players[*a as usize];
         let pb = &players[*b as usize];
@@ -239,12 +249,22 @@ fn test_create_game() {
 
     let funding = fund_cell(&mut context, &dummy_lock, 500_000);
     let state = GameState::waiting(2, 2);
-    let (game_out, game_data) = build_output(200_000, &dummy_lock, Some(&game_type), serialize_game(&state));
+    let (game_out, game_data) = build_output(
+        200_000,
+        &dummy_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
 
     let tx = TransactionBuilder::default()
         .input(CellInput::new_builder().previous_output(funding).build())
         .output(game_out)
-        .output(CellOutput::new_builder().capacity(300_000).lock(dummy_lock.clone()).build())
+        .output(
+            CellOutput::new_builder()
+                .capacity(300_000)
+                .lock(dummy_lock.clone())
+                .build(),
+        )
         .outputs_data(vec![game_data, Bytes::new()].pack())
         .witness(empty_witness())
         .build();
@@ -288,6 +308,339 @@ fn test_join_game_when_contract_is_lock() {
 }
 
 #[test]
+fn test_late_joiner_enters_next_round() {
+    let mut context = Context::default();
+    let game_type = game_type_script(&mut context);
+    let game_lock = always_success_lock(&mut context, Bytes::from(vec![77]));
+    let host_lock = always_success_lock(&mut context, Bytes::from(vec![0]));
+    let guest_lock = always_success_lock(&mut context, Bytes::from(vec![1]));
+    let late_lock = always_success_lock(&mut context, Bytes::from(vec![2]));
+
+    let mut state = GameState::waiting(2, 6);
+    let (game_out, game_data) = build_output(
+        200_000,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let host_fund_0 = fund_cell(&mut context, &host_lock, 500_000);
+    let mut game_out_point = step_transition(
+        &mut context,
+        "create adaptive room",
+        vec![
+            CellInput::new_builder()
+                .previous_output(host_fund_0)
+                .build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(300_000)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness()],
+    );
+
+    add_player(&mut state, Player::new(host_lock.as_bytes(), 100, 100));
+    let (game_out, game_data) = build_output(
+        200_100,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let host_fund_join = fund_cell(&mut context, &host_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "join host",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(host_fund_join)
+                .build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    add_player(&mut state, Player::new(guest_lock.as_bytes(), 100, 100));
+    let (game_out, game_data) = build_output(
+        200_200,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let guest_fund_join = fund_cell(&mut context, &guest_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "join guest",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(guest_fund_join)
+                .build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(guest_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    state.status = STATUS_COMMIT;
+    state.players[0].balance = 200;
+    state.reveal_order = compute_reveal_order(&state.players, state.round);
+    let (game_out, game_data) = build_output(
+        200_300,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let host_fund_start = fund_cell(&mut context, &host_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "start with two active players",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(host_fund_start)
+                .build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    let mut late = Player::new(late_lock.as_bytes(), 100, 100);
+    late.active_from_round = 1;
+    add_player(&mut state, late);
+    let (game_out, game_data) = build_output(
+        200_400,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let late_fund_join = fund_cell(&mut context, &late_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "late join during round zero",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(late_fund_join)
+                .build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(late_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    let host_nonce = b"h0";
+    let guest_nonce = b"g0";
+    state.players[0].commit_hash = hash_reveal(0, host_nonce);
+    state.players[0].has_committed = true;
+    let (game_out, game_data) = build_output(
+        200_400,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let hf = fund_cell(&mut context, &host_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "commit host while late player pending",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(hf).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(200_000)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    state.players[1].commit_hash = hash_reveal(1, guest_nonce);
+    state.players[1].has_committed = true;
+    let (game_out, game_data) = build_output(
+        200_400,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let gf = fund_cell(&mut context, &guest_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "commit guest while late player pending",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(gf).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(200_000)
+                .lock(guest_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+
+    state.status = STATUS_REVEAL;
+    state.players[0].revealed_direction = 0;
+    state.players[0].has_revealed = true;
+    state.players[0].used_directions |= 1;
+    state.reveal_cursor = 1;
+    let (game_out, game_data) = build_output(
+        200_400,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let hf = fund_cell(&mut context, &host_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "reveal host while late player pending",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(hf).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(200_000)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), nonce_witness(host_nonce)],
+    );
+
+    state.players[1].revealed_direction = 1;
+    state.players[1].has_revealed = true;
+    state.players[1].used_directions |= 1u8 << 1;
+    state.reveal_cursor = 2;
+    let (game_out, game_data) = build_output(
+        200_400,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let gf = fund_cell(&mut context, &guest_lock, 200_000);
+    game_out_point = step_transition(
+        &mut context,
+        "reveal guest while late player pending",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(gf).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(200_000)
+                .lock(guest_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), nonce_witness(guest_nonce)],
+    );
+
+    state.status = STATUS_COMMIT;
+    state.round = 1;
+    state.reveal_cursor = 0;
+    state.players[0].balance = 300;
+    for p in &mut state.players {
+        p.commit_hash = [0u8; 32];
+        p.revealed_direction = DIR_NONE;
+        p.has_committed = false;
+        p.has_revealed = false;
+    }
+    state.reveal_order = compute_reveal_order(&state.players, state.round);
+    assert_eq!(state.reveal_order.len(), 3);
+    let (game_out, game_data) = build_output(
+        200_500,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
+    let hf = fund_cell(&mut context, &host_lock, 200_000);
+    let _game_out_point = step_transition(
+        &mut context,
+        "resolve activates late player for next round",
+        vec![
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder().previous_output(hf).build(),
+        ],
+        game_out,
+        game_data,
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(host_lock.clone())
+                .build(),
+        ],
+        vec![Bytes::new()],
+        vec![empty_witness(), empty_witness()],
+    );
+}
+
+#[test]
 fn test_full_two_player_game() {
     let mut context = Context::default();
     let game_type = game_type_script(&mut context);
@@ -296,70 +649,126 @@ fn test_full_two_player_game() {
     let guest_lock = always_success_lock(&mut context, Bytes::from(vec![1]));
 
     let mut state = GameState::waiting(2, 2);
-    let (game_out, game_data) = build_output(200_000, &game_lock, Some(&game_type), serialize_game(&state));
+    let (game_out, game_data) = build_output(
+        200_000,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
     let host_fund_0 = fund_cell(&mut context, &host_lock, 500_000);
     let mut game_out_point = step_transition(
         &mut context,
         "create",
-        vec![CellInput::new_builder().previous_output(host_fund_0).build()],
+        vec![
+            CellInput::new_builder()
+                .previous_output(host_fund_0)
+                .build(),
+        ],
         game_out,
         game_data,
-        vec![CellOutput::new_builder().capacity(300_000).lock(host_lock.clone()).build()],
+        vec![
+            CellOutput::new_builder()
+                .capacity(300_000)
+                .lock(host_lock.clone())
+                .build(),
+        ],
         vec![Bytes::new()],
         vec![empty_witness()],
     );
 
     // ---- join host ----
     add_player(&mut state, Player::new(host_lock.as_bytes(), 200, 200));
-    let (game_out, game_data) = build_output(200_200, &game_lock, Some(&game_type), serialize_game(&state));
+    let (game_out, game_data) = build_output(
+        200_200,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
     let host_fund_join = fund_cell(&mut context, &host_lock, 200_000);
     game_out_point = step_transition(
         &mut context,
         "join host",
         vec![
-            CellInput::new_builder().previous_output(game_out_point).build(),
-            CellInput::new_builder().previous_output(host_fund_join).build(),
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(host_fund_join)
+                .build(),
         ],
         game_out,
         game_data,
-        vec![CellOutput::new_builder().capacity(199_800).lock(host_lock.clone()).build()],
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_800)
+                .lock(host_lock.clone())
+                .build(),
+        ],
         vec![Bytes::new()],
         vec![empty_witness(), empty_witness()],
     );
 
     // ---- join guest ----
     add_player(&mut state, Player::new(guest_lock.as_bytes(), 100, 100));
-    let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+    let (game_out, game_data) = build_output(
+        200_300,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
     let guest_fund_0 = fund_cell(&mut context, &guest_lock, 200_000);
     game_out_point = step_transition(
         &mut context,
         "join guest",
         vec![
-            CellInput::new_builder().previous_output(game_out_point).build(),
-            CellInput::new_builder().previous_output(guest_fund_0).build(),
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(guest_fund_0)
+                .build(),
         ],
         game_out,
         game_data,
-        vec![CellOutput::new_builder().capacity(199_900).lock(guest_lock.clone()).build()],
+        vec![
+            CellOutput::new_builder()
+                .capacity(199_900)
+                .lock(guest_lock.clone())
+                .build(),
+        ],
         vec![Bytes::new()],
         vec![empty_witness(), empty_witness()],
     );
 
     // ---- start ----
     state.status = STATUS_COMMIT;
-    state.reveal_order = compute_reveal_order(&state.players);
-    let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+    state.reveal_order = compute_reveal_order(&state.players, state.round);
+    let (game_out, game_data) = build_output(
+        200_300,
+        &game_lock,
+        Some(&game_type),
+        serialize_game(&state),
+    );
     let host_fund_1 = fund_cell(&mut context, &host_lock, 200_000);
     game_out_point = step_transition(
         &mut context,
         "start",
         vec![
-            CellInput::new_builder().previous_output(game_out_point).build(),
-            CellInput::new_builder().previous_output(host_fund_1).build(),
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+            CellInput::new_builder()
+                .previous_output(host_fund_1)
+                .build(),
         ],
         game_out,
         game_data,
-        vec![CellOutput::new_builder().capacity(200_000).lock(host_lock.clone()).build()],
+        vec![
+            CellOutput::new_builder()
+                .capacity(200_000)
+                .lock(host_lock.clone())
+                .build(),
+        ],
         vec![Bytes::new()],
         vec![empty_witness(), empty_witness()],
     );
@@ -373,39 +782,65 @@ fn test_full_two_player_game() {
 
     for round in 0..ROUNDS {
         // commit guest
-        state.players[1].commit_hash = hash_reveal(guest_dirs[round as usize], guest_nonces[round as usize]);
+        state.players[1].commit_hash =
+            hash_reveal(guest_dirs[round as usize], guest_nonces[round as usize]);
         state.players[1].has_committed = true;
-        let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+        let (game_out, game_data) = build_output(
+            200_300,
+            &game_lock,
+            Some(&game_type),
+            serialize_game(&state),
+        );
         let gf = fund_cell(&mut context, &guest_lock, 200_000);
         game_out_point = step_transition(
             &mut context,
             "commit guest",
             vec![
-                CellInput::new_builder().previous_output(game_out_point).build(),
+                CellInput::new_builder()
+                    .previous_output(game_out_point)
+                    .build(),
                 CellInput::new_builder().previous_output(gf).build(),
             ],
             game_out,
             game_data,
-            vec![CellOutput::new_builder().capacity(200_000).lock(guest_lock.clone()).build()],
+            vec![
+                CellOutput::new_builder()
+                    .capacity(200_000)
+                    .lock(guest_lock.clone())
+                    .build(),
+            ],
             vec![Bytes::new()],
             vec![empty_witness(), empty_witness()],
         );
 
         // commit host
-        state.players[0].commit_hash = hash_reveal(host_dirs[round as usize], host_nonces[round as usize]);
+        state.players[0].commit_hash =
+            hash_reveal(host_dirs[round as usize], host_nonces[round as usize]);
         state.players[0].has_committed = true;
-        let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+        let (game_out, game_data) = build_output(
+            200_300,
+            &game_lock,
+            Some(&game_type),
+            serialize_game(&state),
+        );
         let hf = fund_cell(&mut context, &host_lock, 200_000);
         game_out_point = step_transition(
             &mut context,
             "commit host",
             vec![
-                CellInput::new_builder().previous_output(game_out_point).build(),
+                CellInput::new_builder()
+                    .previous_output(game_out_point)
+                    .build(),
                 CellInput::new_builder().previous_output(hf).build(),
             ],
             game_out,
             game_data,
-            vec![CellOutput::new_builder().capacity(200_000).lock(host_lock.clone()).build()],
+            vec![
+                CellOutput::new_builder()
+                    .capacity(200_000)
+                    .lock(host_lock.clone())
+                    .build(),
+            ],
             vec![Bytes::new()],
             vec![empty_witness(), empty_witness()],
         );
@@ -416,18 +851,30 @@ fn test_full_two_player_game() {
         state.players[1].used_directions |= 1u8 << guest_dirs[round as usize];
         state.status = STATUS_REVEAL;
         state.reveal_cursor = 1;
-        let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+        let (game_out, game_data) = build_output(
+            200_300,
+            &game_lock,
+            Some(&game_type),
+            serialize_game(&state),
+        );
         let gf = fund_cell(&mut context, &guest_lock, 200_000);
         game_out_point = step_transition(
             &mut context,
             "reveal guest",
             vec![
-                CellInput::new_builder().previous_output(game_out_point).build(),
+                CellInput::new_builder()
+                    .previous_output(game_out_point)
+                    .build(),
                 CellInput::new_builder().previous_output(gf).build(),
             ],
             game_out,
             game_data,
-            vec![CellOutput::new_builder().capacity(200_000).lock(guest_lock.clone()).build()],
+            vec![
+                CellOutput::new_builder()
+                    .capacity(200_000)
+                    .lock(guest_lock.clone())
+                    .build(),
+            ],
             vec![Bytes::new()],
             vec![empty_witness(), nonce_witness(guest_nonces[round as usize])],
         );
@@ -437,18 +884,30 @@ fn test_full_two_player_game() {
         state.players[0].has_revealed = true;
         state.players[0].used_directions |= 1u8 << host_dirs[round as usize];
         state.reveal_cursor = 2;
-        let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+        let (game_out, game_data) = build_output(
+            200_300,
+            &game_lock,
+            Some(&game_type),
+            serialize_game(&state),
+        );
         let hf = fund_cell(&mut context, &host_lock, 200_000);
         game_out_point = step_transition(
             &mut context,
             "reveal host",
             vec![
-                CellInput::new_builder().previous_output(game_out_point).build(),
+                CellInput::new_builder()
+                    .previous_output(game_out_point)
+                    .build(),
                 CellInput::new_builder().previous_output(hf).build(),
             ],
             game_out,
             game_data,
-            vec![CellOutput::new_builder().capacity(200_000).lock(host_lock.clone()).build()],
+            vec![
+                CellOutput::new_builder()
+                    .capacity(200_000)
+                    .lock(host_lock.clone())
+                    .build(),
+            ],
             vec![Bytes::new()],
             vec![empty_witness(), nonce_witness(host_nonces[round as usize])],
         );
@@ -471,18 +930,30 @@ fn test_full_two_player_game() {
             state.players[1].has_committed = false;
             state.players[1].has_revealed = false;
         }
-        let (game_out, game_data) = build_output(200_300, &game_lock, Some(&game_type), serialize_game(&state));
+        let (game_out, game_data) = build_output(
+            200_300,
+            &game_lock,
+            Some(&game_type),
+            serialize_game(&state),
+        );
         let hf = fund_cell(&mut context, &host_lock, 200_000);
         game_out_point = step_transition(
             &mut context,
             "resolve",
             vec![
-                CellInput::new_builder().previous_output(game_out_point).build(),
+                CellInput::new_builder()
+                    .previous_output(game_out_point)
+                    .build(),
                 CellInput::new_builder().previous_output(hf).build(),
             ],
             game_out,
             game_data,
-            vec![CellOutput::new_builder().capacity(200_000).lock(host_lock.clone()).build()],
+            vec![
+                CellOutput::new_builder()
+                    .capacity(200_000)
+                    .lock(host_lock.clone())
+                    .build(),
+            ],
             vec![Bytes::new()],
             vec![empty_witness(), empty_witness()],
         );
@@ -492,10 +963,29 @@ fn test_full_two_player_game() {
     assert_eq!(state.players[0].balance, 100);
     assert_eq!(state.players[1].balance, 200);
     let tx = TransactionBuilder::default()
-        .input(CellInput::new_builder().previous_output(game_out_point).build())
-        .output(CellOutput::new_builder().capacity(20_000).lock(host_lock.clone()).build())
-        .output(CellOutput::new_builder().capacity(20_000).lock(guest_lock.clone()).build())
-        .output(CellOutput::new_builder().capacity(160_300).lock(host_lock.clone()).build())
+        .input(
+            CellInput::new_builder()
+                .previous_output(game_out_point)
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(20_000)
+                .lock(host_lock.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(20_000)
+                .lock(guest_lock.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(160_300)
+                .lock(host_lock.clone())
+                .build(),
+        )
         .outputs_data(vec![Bytes::new(); 3].pack())
         .witness(empty_witness())
         .build();

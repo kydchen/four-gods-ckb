@@ -9,6 +9,7 @@ frontend/.next
 frontend/out
 frontend/dist
 contracts/**/build
+output/
 
 # OS / Editor
 .DS_Store
